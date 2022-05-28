@@ -14,10 +14,6 @@ import {
 	MeshPhongMaterial,
 	MeshBasicMaterial,
 	BufferGeometry,
-	Quaternion,
-	Plane,
-	Shape,
-	ShapeBufferGeometry,
 	TextureLoader,
 	RepeatWrapping,
 	LinearEncoding,
@@ -31,6 +27,8 @@ import {
 	LineBasicMaterial,
 	SphereGeometry
 } from 'three';
+
+import { Earcut } from 'three/src/extras/Earcut.js';
 
 const LightSampling = {
 	FACET: 1,
@@ -61,124 +59,6 @@ const pictureTag = 200;
 const ratioHintDelta = 0.3;
 const sqrdRatioHintDelta = ratioHintDelta * ratioHintDelta;
 const glossRatio = 0.1;
-
-function triangulateFacesWithShapes( vertices, uvs, loop ) {
-
-	// Mostly crediting @neeh for their answer: https://stackoverflow.com/a/42402681
-	const _ctr = new Vector3();
-
-	let _basis = new Matrix4();
-	const _plane = new Plane();
-	const _q = new Quaternion();
-	const _y = new Vector3();
-	const _x = new Vector3();
-
-	const X = new Vector3( 1.0, 0.0, 0.0 );
-	const Z = new Vector3( 0.0, 0.0, 1.0 );
-
-	let _tmp = new Vector3();
-
-	let newVertices = [];
-	let newUvs = [];
-	let faces = [];
-
-	let offset = vertices.length / 3;
-	let vertexMap = {};
-
-	// Compute centroid
-	_ctr.setScalar( 0.0 );
-
-	let l = loop.length;
-	for ( let i = 0; i < l; i ++ ) {
-
-		_ctr.add( new Vector3( vertices[ loop[ i ] * 3 ], vertices[ loop[ i ] * 3 + 1 ], vertices[ loop[ i ] * 3 + 2 ] ) );
-		vertexMap[ i ] = loop[ i ];
-
-	}
-
-	_ctr.multiplyScalar( 1.0 / l );
-
-	let loopNormal = new Vector3( 0.0, 0.0, 0.0 );
-
-	// Compute loop normal using Newell's Method
-	for ( let i = 0; i < l; i ++ ) {
-
-		const currentVertex = new Vector3( vertices[ loop[ i ] * 3 ], vertices[ loop[ i ] * 3 + 1 ], vertices[ loop[ i ] * 3 + 2 ] );
-
-		let nextVertex = new Vector3(
-			vertices[ loop[ ( ( i + 1 ) % l ) ] * 3 ],
-			vertices[ loop[ ( ( i + 1 ) % l ) ] * 3 + 1 ],
-			vertices[ loop[ ( ( i + 1 ) % l ) ] * 3 + 2 ]
-		);
-
-		loopNormal.x += ( currentVertex.y - nextVertex.y ) * ( currentVertex.z + nextVertex.z );
-		loopNormal.y += ( currentVertex.z - nextVertex.z ) * ( currentVertex.x + nextVertex.x );
-		loopNormal.z += ( currentVertex.x - nextVertex.x ) * ( currentVertex.y + nextVertex.y );
-
-	}
-
-	loopNormal.normalize();
-
-	const coplanarVertex = new Vector3( vertices[ loop[ 0 ] * 3 ], vertices[ loop[ 0 ] * 3 + 1 ], vertices[ loop[ 0 ] * 3 + 2 ] );
-	_plane.setFromNormalAndCoplanarPoint( loopNormal, coplanarVertex );
-	let _z = _plane.normal;
-
-	// Compute basis
-	_q.setFromUnitVectors( Z, _z );
-	_x.copy( X ).applyQuaternion( _q );
-	_y.crossVectors( _x, _z );
-	_y.normalize();
-	_basis.makeBasis( _x, _y, _z );
-	_basis.setPosition( _ctr );
-
-	// Project the 3D vertices on the 2D plane
-	let projVertices = [];
-	for ( let i = 0; i < l; i ++ ) {
-
-		const currentVertex = new Vector3( vertices[ loop[ i ] * 3 ], vertices[ loop[ i ] * 3 + 1 ], vertices[ loop[ i ] * 3 + 2 ] );
-		_tmp.subVectors( currentVertex, _ctr );
-		projVertices.push( new Vector2( _tmp.dot( _x ), _tmp.dot( _y ) ) );
-
-	}
-
-	// Create the geometry (Three.js triangulation with ShapeGeometry)
-	let shape = new Shape( projVertices );
-	let geometry = new ShapeBufferGeometry( shape );
-
-	geometry.applyMatrix4( _basis );
-
-	let bufferPosition = geometry.getAttribute( 'position' );
-	const shapeIndices = geometry.getIndex().array;
-
-	/*
-	* Replace the positions for each vertex in the newly computed (flat and planar) polygon with the ones from the original
-	* set of vertices it was fed with, thus "sealing" the geometry perfectly despite the vertices being duplicated.
-	*/
-	for ( let i = 0, lVertices = bufferPosition.count; i < lVertices; i ++ ) {
-
-		bufferPosition.setXYZ(
-			i,
-			vertices[ vertexMap[ i ] * 3 ],
-			vertices[ vertexMap[ i ] * 3 + 1 ],
-			vertices[ vertexMap[ i ] * 3 + 2 ]
-		);
-
-		newUvs.push( uvs[ vertexMap[ i ] * 2 ], uvs[ vertexMap[ i ] * 2 + 1 ] );
-
-	}
-
-	// Use the vertex indices from each newly computed 2D face to extend our current set
-	for ( let i = 0, lFaces = shapeIndices.length; i < lFaces; i ++ ) {
-
-		faces.push( shapeIndices[ i ] + offset );
-
-	}
-
-	newVertices.push( ...bufferPosition.array );
-
-	return [ newVertices, newUvs, faces ];
-
-}
 
 function makeMaskPromise( bmpURI, threeMat, loader, textureEncoding = LinearEncoding ) {
 
@@ -536,17 +416,27 @@ function addPolygon( ctx, indices ) {
 
 	}
 
-	const [ newVertices, newUVs, newFaces ] =
-		triangulateFacesWithShapes( ctx.currentBufferVertices, ctx.currentBufferUVs, indices );
+	const vertexIdMap = [];
+	const earcutData = [];
 
-	ctx.currentBufferVertices.push( ...newVertices );
-	ctx.currentBufferUVs.push( ...newUVs );
+	// Use Earcut for triangulation
+	for ( let i = 0; i < indices.length; i ++ ) {
+
+		vertexIdMap.push( indices[ i ] );
+		earcutData.push( ctx.currentBufferVertices[ indices[ i ] * 3 ],
+			ctx.currentBufferVertices[ indices[ i ] * 3 + 1 ],
+			ctx.currentBufferVertices[ indices[ i ] * 3 + 2 ] );
+
+	}
+
+	const newFaces = Earcut.triangulate( earcutData, null, 3 );
 
 	for ( let lf = 0; lf < newFaces.length; lf += 3 ) {
 
-		const a = newFaces[ lf ];
-		const b = newFaces[ lf + 1 ];
-		const c = newFaces[ lf + 2 ];
+		// The new face IDs need to be mapped back to the original set
+		const a = vertexIdMap[ newFaces[ lf ] ];
+		const b = vertexIdMap[ newFaces[ lf + 1 ] ];
+		const c = vertexIdMap[ newFaces[ lf + 2 ] ];
 
 		// Add new face
 		ctx.currentBufferFaceCount ++;
